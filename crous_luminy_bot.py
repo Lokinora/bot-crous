@@ -3,10 +3,11 @@
 Alerte Discord dès qu'un logement CROUS apparaît à Luminy (Marseille).
 
 Fonctionnement :
-  1. Interroge le moteur de recherche de trouverunlogement.lescrous.fr
-     sur une zone autour du campus de Luminy (API JSON du site).
-  2. Si l'API ne répond pas comme prévu, lit les pages de résultats HTML
-     et garde les annonces dont le texte contient "Luminy".
+  1. Récupère TOUTE l'offre publique de trouverunlogement.lescrous.fr
+     (API JSON du site) et garde les logements situés à Luminy : position
+     GPS dans la zone du campus, ou "Luminy" dans le nom ou l'adresse.
+  2. Si l'API ne répond pas comme prévu, lit toutes les pages de résultats
+     HTML et garde les annonces dont le texte contient "Luminy".
   3. Envoie un message sur Discord (webhook) pour chaque logement qui
      n'était pas visible au passage précédent — y compris un logement
      qui disparaît puis réapparaît (désistement).
@@ -46,8 +47,8 @@ INTERVAL = int(os.getenv("INTERVAL_SECONDS", "180"))
 
 # Zone autour du campus de Luminy (13009 Marseille)
 BOUNDS = {"north": 43.245, "south": 43.220, "west": 5.415, "east": 5.460}
-# Mots-clés utilisés pour le filtrage texte (secours HTML)
-KEYWORDS = ["luminy"]
+# Mots-clés : un logement est retenu si son nom ou son adresse en contient un
+KEYWORDS = ["luminy", "13288"]  # 13288 = code postal cedex du campus
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) alerte-logement-luminy",
@@ -67,59 +68,87 @@ def in_bounds(lat, lon):
             and BOUNDS["west"] <= lon <= BOUNDS["east"])
 
 
+# Emprise de toute la France (métropole + Corse), comme le site par défaut
+FRANCE = [{"lon": -9.9079, "lat": 51.7087}, {"lon": 14.3224, "lat": 40.5721}]
+
+
+def _is_luminy(lat, lon, texte):
+    """Vrai si le logement est à Luminy (coordonnées GPS OU nom/adresse)."""
+    if lat is not None and lon is not None:
+        try:
+            if in_bounds(float(lat), float(lon)):
+                return True
+        except (TypeError, ValueError):
+            pass
+    return any(k in texte.lower() for k in KEYWORDS)
+
+
+def _fmt_prix(v):
+    if not isinstance(v, (int, float)) or v <= 0:
+        return None
+    v = v / 100 if v > 5000 else v  # l'API donne parfois les loyers en centimes
+    return f"{v:.2f} €".replace(".", ",")
+
+
 def search_api():
-    """Recherche par zone géographique via l'API JSON utilisée par le site."""
-    payload = {
-        "idTool": TOOL_ID,
-        "need_aggregation": False,
-        "page": 1,
-        "pageSize": 100,
-        "sector": None,
-        "occupationModes": [],
-        "residence": None,
-        "precision": 5,
-        "equipment": [],
-        "price": {"max": 10000000},
-        "area": {"min": 0},
-        "location": [
-            {"lon": BOUNDS["west"], "lat": BOUNDS["north"]},
-            {"lon": BOUNDS["east"], "lat": BOUNDS["south"]},
-        ],
-    }
-    r = requests.post(f"{BASE}/api/fr/search/{TOOL_ID}", json=payload,
-                      headers=HEADERS, timeout=25)
-    r.raise_for_status()
-    items = (r.json().get("results") or {}).get("items")
-    if not isinstance(items, list):
-        raise ValueError("format de réponse API inattendu")
-    log(f"API : {len(items)} résultat(s) renvoyé(s) pour la zone")
+    """Récupère TOUTE l'offre France via l'API du site, puis filtre Luminy ici.
 
-    found = {}
-    for it in items:
-        res = it.get("residence") or {}
-        loc = res.get("location") or {}
-        titre = it.get("label") or res.get("label") or "Logement CROUS"
-        adresse = res.get("address") or ""
-        texte = f"{titre} {res.get('label', '')} {adresse}".lower()
-
-        # Garde-fou : on ne garde que ce qui est vraiment à Luminy
-        if "lat" in loc and "lon" in loc:
-            if not in_bounds(float(loc["lat"]), float(loc["lon"])):
-                continue
-        elif not any(k in texte for k in KEYWORDS):
-            continue
-
-        details = [res.get("label", ""), adresse]
-        area = it.get("area") or {}
-        if area.get("min"):
-            details.append(f"{area['min']} m²" if area.get("min") == area.get("max")
-                           else f"{area.get('min')}–{area.get('max')} m²")
-        found[str(it["id"])] = {
-            "titre": titre,
-            "details": " · ".join(d for d in details if d),
-            "url": f"{BASE}/tools/{TOOL_ID}/accommodations/{it['id']}",
+    On ne demande pas à l'API de filtrer la zone : si le format de la zone
+    était mal compris par le site, on raterait des logements sans le savoir.
+    Renvoie (logements_luminy, nombre_total_en_france).
+    """
+    found, total, page = {}, 0, 1
+    while page <= 50:
+        payload = {
+            "idTool": TOOL_ID, "need_aggregation": False,
+            "page": page, "pageSize": 100,
+            "sector": None, "occupationModes": [], "residence": None,
+            "precision": 4, "equipment": [],
+            "price": {"max": 10000000}, "area": {"min": 0},
+            "location": FRANCE,
         }
-    return found
+        r = requests.post(f"{BASE}/api/fr/search/{TOOL_ID}", json=payload,
+                          headers=HEADERS, timeout=25)
+        r.raise_for_status()
+        results = r.json().get("results") or {}
+        items = results.get("items")
+        if not isinstance(items, list):
+            raise ValueError("format de réponse API inattendu")
+        total += len(items)
+
+        for it in items:
+            res = it.get("residence") or {}
+            loc = res.get("location") or {}
+            titre = it.get("label") or res.get("label") or "Logement CROUS"
+            adresse = res.get("address") or ""
+            texte = f"{titre} {res.get('label', '')} {adresse}"
+            if not _is_luminy(loc.get("lat"), loc.get("lon"), texte):
+                continue
+
+            details = [res.get("label", ""), adresse]
+            area = it.get("area") or {}
+            if area.get("min"):
+                details.append(f"{area['min']} m²" if area.get("min") == area.get("max")
+                               else f"{area.get('min')}–{area.get('max')} m²")
+            for mode in it.get("occupationModes") or []:
+                rent = mode.get("rent") or {}
+                prix = _fmt_prix(rent.get("min"))
+                if prix:
+                    genre = {"alone": "Individuel", "couple": "Couple",
+                             "house_sharing": "Colocation"}.get(mode.get("type"), "")
+                    details.append(f"{genre} : {prix}" if genre else prix)
+            found[str(it["id"])] = {
+                "titre": titre,
+                "details": " · ".join(d for d in details if d),
+                "url": f"{BASE}/tools/{TOOL_ID}/accommodations/{it['id']}",
+            }
+
+        if len(items) < 100:
+            break
+        page += 1
+        time.sleep(1)
+    log(f"API : {total} logement(s) en France, dont {len(found)} à Luminy")
+    return found, total
 
 
 def _card_for(link, acc_id):
@@ -134,9 +163,9 @@ def _card_for(link, acc_id):
     return card
 
 
-def search_html(max_pages=60):
-    """Secours : parcourt les pages de résultats et filtre par mot-clé."""
-    found = {}
+def search_html(max_pages=150):
+    """Secours : parcourt toutes les pages de résultats et filtre par mot-clé."""
+    found, total = {}, 0
     for page in range(1, max_pages + 1):
         r = requests.get(f"{BASE}/tools/{TOOL_ID}/search", params={"page": page},
                          headers=HEADERS, timeout=25)
@@ -146,6 +175,7 @@ def search_html(max_pages=60):
             or soup.select('a[href*="/accommodations/"]')
         if not links:
             break
+        total += len(links)
         for a in links:
             m = re.search(r"/accommodations/(\d+)", a.get("href", ""))
             if not m:
@@ -161,15 +191,19 @@ def search_html(max_pages=60):
         if not soup.find("a", string=re.compile(r"Page suivante", re.I)):
             break
         time.sleep(1)  # on reste poli avec le site
-    return found
+    log(f"HTML : {total} logement(s) en France, dont {len(found)} à Luminy")
+    return found, total
 
 
 def search():
     try:
-        return search_api()
+        found, total = search_api()
+        if total > 0:
+            return found, total
+        log("API : 0 logement en France, vérification par la lecture HTML")
     except Exception as e:  # noqa: BLE001
         log(f"API indisponible ({e}), passage à la lecture HTML")
-        return search_html()
+    return search_html()
 
 
 # --------------------------------------------------------------------------
@@ -224,9 +258,10 @@ def save_state(ids):
 
 
 def check_once():
+    """Renvoie (nb_luminy, nb_france), ou None si la recherche a échoué."""
     previous = load_state()
     try:
-        current = search()
+        current, total = search()
     except Exception as e:  # noqa: BLE001
         log(f"Erreur pendant la recherche : {e}")
         return None  # on ne touche pas à l'état pour ne pas rater d'annonce
@@ -236,7 +271,7 @@ def check_once():
         notify(current[i])
         time.sleep(1)
     save_state(current.keys())
-    return len(current)
+    return len(current), total
 
 
 def main():
@@ -250,16 +285,20 @@ def main():
         log("Message de test envoyé")
         return
     if args.once:
-        count = check_once()
+        result = check_once()
         # Lancement manuel depuis GitHub ("Run workflow") : bilan sur Discord
         if os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch":
-            if count is None:
-                bilan = "⚠️ Vérification manuelle : erreur pendant la recherche, regarde les logs GitHub."
+            if result is None:
+                bilan = ("⚠️ Vérification manuelle : erreur pendant la recherche, "
+                         "regarde les logs GitHub.")
             else:
-                bilan = (f"✅ Bot CROUS Luminy opérationnel — {count} logement(s) "
-                         "actuellement en ligne à Luminy.")
+                luminy, france = result
+                bilan = (f"✅ Bot CROUS Luminy opérationnel — le site affiche {france} "
+                         f"logement(s) en France, dont {luminy} à Luminy.")
             discord_send(bilan)
             log("Bilan envoyé sur Discord")
+        if result is None:
+            sys.exit(1)  # croix rouge sur GitHub + mail : on sait que ça a planté
         return
     log(f"Surveillance lancée (toutes les {INTERVAL} s). Ctrl+C pour arrêter.")
     while True:
