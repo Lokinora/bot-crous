@@ -281,6 +281,39 @@ def _describe(page):
     return f"{u.netloc}{u.path} | champs={champs} | boutons={boutons}"
 
 
+def _cases_a_cocher(page):
+    """Coche seulement "se souvenir de moi" / "rester connecté".
+
+    Une case inconnue peut être un piège anti-robot : on n'y touche pas.
+    """
+    for case in page.locator("input[type=checkbox]").all()[:5]:
+        try:
+            label = ""
+            cid = case.get_attribute("id")
+            if cid and page.locator(f"label[for='{cid}']").count():
+                label = page.locator(f"label[for='{cid}']").first.inner_text()
+            if not label:
+                label = case.evaluate("e => (e.closest('label') || "
+                                      "e.parentElement || {}).innerText || ''")
+            label = " ".join(label.split())[:60]
+            visible = case.is_visible()
+            cocher = visible and bool(re.search(r"souvenir|rester|connect", label, re.I))
+            log(f"Case à cocher : « {label} » visible={visible} cochée_par_le_bot={cocher}")
+            if cocher and not case.is_checked():
+                case.check()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _texte_page(page):
+    """Début du texte affiché (page de connexion : aucune donnée perso)."""
+    try:
+        t = " ".join(page.locator("main, form, body").first.inner_text().split())
+        return t[:300]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _message_erreur(page):
     """Texte d'erreur affiché par MesServices (ex : "mot de passe incorrect")."""
     try:
@@ -363,8 +396,9 @@ def browser_login(ctx):
         if pwd:
             tentatives += 1
             if tentatives > 1:  # déjà soumis une fois : refusé
-                raise LoginError("identifiant ou mot de passe refusé ? "
-                                 + _message_erreur(page) + " | " + _describe(page))
+                raise LoginError("toujours sur le formulaire après envoi. "
+                                 + _message_erreur(page) + " | " + _describe(page)
+                                 + " | texte : " + _texte_page(page))
             user = _first_visible(page, USER_FIELDS)
             if not user:  # dernier recours : le champ texte du même formulaire
                 user = _first_visible(page, [
@@ -374,19 +408,31 @@ def browser_login(ctx):
             if user:
                 user.fill(MSE_EMAIL)
             pwd.fill(MSE_PASSWORD)
-            for case in page.locator("input[type=checkbox]:visible").all()[:3]:
-                try:  # "se souvenir de moi" : on coche
-                    if not case.is_checked():
-                        case.check()
-                except Exception:  # noqa: BLE001
-                    pass
+            _cases_a_cocher(page)
             bouton = _first_visible(page, [
                 "button:has-text(\"S'identifier\")", "button[type=submit]",
                 "input[type=submit]", "button:has-text('Connexion')"])
-            if bouton:
-                bouton.click()
-            else:
-                pwd.press("Enter")
+            envois = []
+            page.on("response", lambda r: envois.append(r.status)
+                    if r.request.method == "POST" else None)
+            url_avant = page.url
+            try:
+                with page.expect_navigation(timeout=30000):
+                    if bouton:
+                        bouton.click()
+                    else:
+                        pwd.press("Enter")
+            except Exception:  # noqa: BLE001  (pas de changement de page)
+                pass
+            # Laisse le temps aux redirections (MesServices -> CROUS)
+            for _ in range(20):
+                if page.url != url_avant or not _first_visible(
+                        page, ["input[type=password]"]):
+                    break
+                page.wait_for_timeout(1000)
+            _settle(page)
+            log(f"Formulaire envoyé : réponses POST={envois[:3]}, "
+                f"page={urlparse(page.url).netloc}{urlparse(page.url).path}")
             continue
         user = _first_visible(page, USER_FIELDS)
         if user:  # formulaire en deux temps : email puis mot de passe
