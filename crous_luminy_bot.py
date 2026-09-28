@@ -315,10 +315,20 @@ COOKIE_BUTTONS = ["button:has-text('Tout accepter')", "button:has-text('Accepter
 
 
 def _is_logged_in(ctx):
+    """Connecté = le menu n'a plus de lien "Identification" vers MesServices.
+
+    On ne regarde que les vrais liens <a> (pas le code JavaScript de la page,
+    qui peut contenir "logout" même quand on n'est pas connecté).
+    """
     html = ctx.request.get(search_url(1)).text()
-    low = html.lower()
-    return ("logout" in low or "déconnexion" in low or "deconnexion" in low
-            or "/mse/discovery/connect" not in low)
+    soup = BeautifulSoup(html, "html.parser")
+    liens = [a.get("href", "").lower() for a in soup.find_all("a")]
+    identification = any("/mse/discovery/connect" in h for h in liens)
+    deconnexion = any(("logout" in h or "deconnexion" in h or "disconnect" in h)
+                      for h in liens)
+    log(f"Vérif connexion : lien Identification={identification}, "
+        f"lien Déconnexion={deconnexion}")
+    return deconnexion or not identification
 
 
 def browser_login(ctx):
