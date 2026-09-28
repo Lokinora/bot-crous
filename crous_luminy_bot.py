@@ -104,15 +104,25 @@ def _card_for(link, acc_id):
     return card
 
 
-def parse_total(html):
-    """Nombre affiché par le site : "330 logements trouvés" / "Aucun logement"."""
-    texte = " ".join(BeautifulSoup(html, "html.parser").get_text(" ").split())
-    m = re.search(r"(\d[\d\s  ]*)\s+logements?\s+trouv", texte, re.I)
+def count_from_text(texte):
+    """ "330 logements trouvés" -> 330 ; "Aucun logement" -> 0 ; sinon None."""
+    texte = " ".join(texte.split())
+    m = re.search(r"(?<![\d\u2011-])(\d{1,3}(?:[\s\u202f\u00a0]\d{3})+|\d+)"
+                  r"\s+logements?\s+trouv", texte, re.I)
     if m:
         return int(re.sub(r"\D", "", m.group(1)))
     if re.search(r"aucun logement", texte, re.I):
         return 0
     return None
+
+
+def parse_total(html):
+    soup = BeautifulSoup(html, "html.parser")
+    for h in soup.find_all(["h1", "h2", "h3", "p", "span"]):
+        n = count_from_text(h.get_text(" "))
+        if n is not None:
+            return n
+    return count_from_text(soup.get_text(" "))
 
 
 def scan_html(fetch, max_pages=150):
@@ -143,7 +153,7 @@ def scan_html(fetch, max_pages=150):
         if not soup.find("a", string=re.compile(r"Page suivante", re.I)):
             break
         time.sleep(0.5)
-    return found, max(count, total or 0)
+    return found, total if total is not None else count
 
 
 def search_url(page):
@@ -161,6 +171,33 @@ def _fmt_prix(v):
         return None
     v = v / 100 if v > 5000 else v  # loyers parfois donnés en centimes
     return f"{v:.2f} €".replace(".", ",")
+
+
+def parse_items(items, found):
+    """Ajoute à `found` les annonces de l'API situées à Luminy."""
+    for it in items:
+        res = it.get("residence") or {}
+        loc = res.get("location") or {}
+        titre = it.get("label") or res.get("label") or "Logement CROUS"
+        adresse = res.get("address") or ""
+        if not _is_luminy(loc.get("lat"), loc.get("lon"),
+                          f"{titre} {res.get('label', '')} {adresse}"):
+            continue
+        details = [res.get("label", ""), adresse]
+        area = it.get("area") or {}
+        if area.get("min"):
+            details.append(f"{area['min']} m²")
+        for mode in it.get("occupationModes") or []:
+            prix = _fmt_prix((mode.get("rent") or {}).get("min"))
+            if prix:
+                genre = {"alone": "Individuel", "couple": "Couple",
+                         "house_sharing": "Colocation"}.get(mode.get("type"), "")
+                details.append(f"{genre} : {prix}" if genre else prix)
+        found[str(it["id"])] = {
+            "titre": titre,
+            "details": " · ".join(d for d in details if d),
+            "url": f"{BASE}/tools/{TOOL_ID}/accommodations/{it['id']}",
+        }
 
 
 def search_api():
@@ -181,29 +218,7 @@ def search_api():
         if not isinstance(items, list):
             raise ValueError("format de réponse API inattendu")
         total += len(items)
-        for it in items:
-            res = it.get("residence") or {}
-            loc = res.get("location") or {}
-            titre = it.get("label") or res.get("label") or "Logement CROUS"
-            adresse = res.get("address") or ""
-            if not _is_luminy(loc.get("lat"), loc.get("lon"),
-                              f"{titre} {res.get('label', '')} {adresse}"):
-                continue
-            details = [res.get("label", ""), adresse]
-            area = it.get("area") or {}
-            if area.get("min"):
-                details.append(f"{area['min']} m²")
-            for mode in it.get("occupationModes") or []:
-                prix = _fmt_prix((mode.get("rent") or {}).get("min"))
-                if prix:
-                    genre = {"alone": "Individuel", "couple": "Couple",
-                             "house_sharing": "Colocation"}.get(mode.get("type"), "")
-                    details.append(f"{genre} : {prix}" if genre else prix)
-            found[str(it["id"])] = {
-                "titre": titre,
-                "details": " · ".join(d for d in details if d),
-                "url": f"{BASE}/tools/{TOOL_ID}/accommodations/{it['id']}",
-            }
+        parse_items(items, found)
         if len(items) < 100:
             break
         page += 1
@@ -359,6 +374,21 @@ def browser_login(ctx):
     page.close()
 
 
+def _rendered_total(page):
+    """Nombre affiché à l'écran ("330 logements trouvés"), après JavaScript."""
+    for sel in ["h2:has-text('trouv')", "h1:has-text('trouv')",
+                "*:has-text('logements trouv')", "*:has-text('Aucun logement')"]:
+        try:
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 5)):
+                n = count_from_text(loc.nth(i).inner_text())
+                if n is not None:
+                    return n
+        except Exception:  # noqa: BLE001
+            continue
+    return count_from_text(page.content())
+
+
 def search_logged_in():
     from playwright.sync_api import sync_playwright
 
@@ -379,13 +409,58 @@ def search_logged_in():
                 log("Connecté")
             save_session(ctx.storage_state())
 
-            def fetch(page):
-                r = ctx.request.get(search_url(page))
-                if not r.ok:
-                    raise RuntimeError(f"HTTP {r.status} sur la page {page}")
-                return r.text()
+            # Ouvre la page de recherche comme dans un vrai navigateur et
+            # note la requête que le site envoie à son API.
+            captured = []
 
-            found, total = scan_html(fetch)
+            def on_request(req):
+                if "/api/fr/search/" in req.url and req.method == "POST":
+                    captured.append(req)
+
+            page = ctx.new_page()
+            page.on("request", on_request)
+            page.goto(search_url(1), wait_until="domcontentloaded")
+            _settle(page)
+            page.wait_for_timeout(2000)
+            affiche = _rendered_total(page)
+            log(f"La page de recherche (connecté) affiche {affiche} logement(s)")
+
+            found, recus = {}, 0
+            if captured:
+                req = captured[-1]
+                payload = json.loads(req.post_data or "{}")
+                headers = {k: v for k, v in req.headers.items()
+                           if k.lower() in ("content-type", "accept",
+                                            "x-requested-with", "x-csrf-token")}
+                page_size = int(payload.get("pageSize") or 24)
+                payload["pageSize"] = max(page_size, 100)
+                for n in range(1, 101):
+                    payload["page"] = n
+                    r = ctx.request.post(req.url, data=json.dumps(payload),
+                                         headers=headers or
+                                         {"content-type": "application/json"})
+                    if not r.ok:
+                        raise RuntimeError(f"API connectée : HTTP {r.status}")
+                    results = r.json().get("results") or {}
+                    items = results.get("items") or []
+                    recus += len(items)
+                    parse_items(items, found)
+                    total_api = (results.get("total") or {}).get("value")
+                    if not items or (total_api and recus >= total_api):
+                        break
+                    time.sleep(0.5)
+                log(f"API (connecté) : {recus} logement(s) récupéré(s)")
+            else:
+                log("Aucune requête API vue : lecture des pages affichées")
+
+                def fetch(n):
+                    page.goto(search_url(n), wait_until="domcontentloaded")
+                    _settle(page)
+                    return page.content()
+
+                found, recus = scan_html(fetch)
+
+            total = max(affiche or 0, recus)
             log(f"Offre connectée : {total} logement(s), dont {len(found)} à Luminy")
             return found, total
         finally:
