@@ -281,6 +281,19 @@ def _describe(page):
     return f"{u.netloc}{u.path} | champs={champs} | boutons={boutons}"
 
 
+def _message_erreur(page):
+    """Texte d'erreur affiché par MesServices (ex : "mot de passe incorrect")."""
+    try:
+        for el in page.locator(".error:visible, .alert:visible, .fr-alert:visible, "
+                               ".fr-error-text:visible, [role=alert]:visible").all()[:3]:
+            t = " ".join(el.inner_text().split())
+            if t:
+                return f"message du site : « {t[:150]} »"
+    except Exception:  # noqa: BLE001
+        pass
+    return "pas de message d'erreur visible"
+
+
 def _first_visible(page, selectors):
     for sel in selectors:
         loc = page.locator(sel)
@@ -301,7 +314,8 @@ def _settle(page):
     page.wait_for_timeout(800)
 
 
-USER_FIELDS = ["input[name=j_username]", "input[name=username]",
+USER_FIELDS = ["input[name='login[login]']", "input[name='login[email]']",
+               "input[name='login[username]']", "input[name=j_username]", "input[name=username]",
                "input[type=email]", "input#username", "input[name=login]",
                "input[name=email]", "input[autocomplete=username]"]
 LOGIN_BUTTONS = [".loginapp-button",
@@ -350,12 +364,29 @@ def browser_login(ctx):
             tentatives += 1
             if tentatives > 1:  # déjà soumis une fois : refusé
                 raise LoginError("identifiant ou mot de passe refusé ? "
-                                 + _describe(page))
+                                 + _message_erreur(page) + " | " + _describe(page))
             user = _first_visible(page, USER_FIELDS)
+            if not user:  # dernier recours : le champ texte du même formulaire
+                user = _first_visible(page, [
+                    "form:has(input[type=password]) input[type=text]",
+                    "form:has(input[type=password]) input[type=email]"])
+            log(f"Formulaire MesServices : champ identifiant trouvé={bool(user)}")
             if user:
                 user.fill(MSE_EMAIL)
             pwd.fill(MSE_PASSWORD)
-            pwd.press("Enter")
+            for case in page.locator("input[type=checkbox]:visible").all()[:3]:
+                try:  # "se souvenir de moi" : on coche
+                    if not case.is_checked():
+                        case.check()
+                except Exception:  # noqa: BLE001
+                    pass
+            bouton = _first_visible(page, [
+                "button:has-text(\"S'identifier\")", "button[type=submit]",
+                "input[type=submit]", "button:has-text('Connexion')"])
+            if bouton:
+                bouton.click()
+            else:
+                pwd.press("Enter")
             continue
         user = _first_visible(page, USER_FIELDS)
         if user:  # formulaire en deux temps : email puis mot de passe
