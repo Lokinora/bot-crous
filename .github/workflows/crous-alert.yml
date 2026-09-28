@@ -9,23 +9,44 @@ concurrency: crous-luminy
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - run: pip install -r requirements.txt
-      - uses: actions/cache/restore@v4
+
+      - name: Navigateur (mis en cache)
+        uses: actions/cache@v4
         with:
-          path: seen.json
-          key: crous-seen-${{ github.run_id }}
-          restore-keys: crous-seen-
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ hashFiles('requirements.txt') }}
+
+      - run: python -m playwright install --with-deps chromium
+
+      - name: Récupère les logements déjà vus et la session
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            seen.json
+            session.bin
+          key: crous-state-${{ github.run_id }}
+          restore-keys: crous-state-
+
       - run: python crous_luminy_bot.py --once
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          MSE_EMAIL: ${{ secrets.MSE_EMAIL }}
+          MSE_PASSWORD: ${{ secrets.MSE_PASSWORD }}
+
       - uses: actions/cache/save@v4
         if: always()
         with:
-          path: seen.json
-          key: crous-seen-${{ github.run_id }}
+          path: |
+            seen.json
+            session.bin
+          key: crous-state-${{ github.run_id }}
